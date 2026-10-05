@@ -3,6 +3,7 @@ from genlayer import *
 from dataclasses import dataclass
 import json
 
+# Compatibility guard: Ensure gl.UserError is available across GenVM and gltest direct environments
 if not hasattr(gl, "UserError"):
     try:
         gl.UserError = gl.vm.UserError
@@ -436,7 +437,8 @@ Respond ONLY with a VALID JSON object (no markdown, no backticks):
     @gl.public.view
     def is_repo_blacklisted(self, repo_url: str) -> bool:
         """Check if an accused repository has been confirmed as an infringing copycat on-chain."""
-        return self.blacklisted_repos.get(repo_url.strip().lower(), False)
+        clean_url = repo_url.strip().lower()
+        return clean_url in self.blacklisted_repos and self.blacklisted_repos[clean_url]
 
     @gl.public.view
     def get_dispute(self, dispute_id: str) -> str:
