@@ -3,6 +3,7 @@
 > **Track:** Onchain Justice / Autonomous Protocols  
 > **Target Environment:** [GenLayer Studio](https://studio.genlayer.com)  
 > **Network:** GenLayer `studionet` (Chain ID: `61999` / `0xF1EF`)  
+> **Contract Address:** `0xdC6071B638c2653DDd6FaB9118b0Fd80FB9949D4`  
 > **Contract Source:** [`contracts/ip_copyright_court_x.py`](contracts/ip_copyright_court_x.py)  
 > **Execution Engine:** GenVM / Optimistic Democracy Subjective Consensus  
 > **Package / SDK:** `py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6`  
@@ -10,7 +11,19 @@
 
 ---
 
-## 1. Abstract & Problem Statement
+## 1. Deployment & Live Network Evidence
+
+The `IPCopyrightCourtX` Intelligent Contract is successfully deployed on GenLayer studionet:
+
+- **Contract Address:** `0xdC6071B638c2653DDd6FaB9118b0Fd80FB9949D4`
+- **Network:** `studionet` (Chain ID: `61999` / `0xF1EF`)
+- **Explorer:** [https://explorer.genlayer.com/address/0xdC6071B638c2653DDd6FaB9118b0Fd80FB9949D4](https://explorer.genlayer.com/address/0xdC6071B638c2653DDd6FaB9118b0Fd80FB9949D4)
+- **Studio Explorer:** [https://explorer-studio.genlayer.com/address/0xdC6071B638c2653DDd6FaB9118b0Fd80FB9949D4](https://explorer-studio.genlayer.com/address/0xdC6071B638c2653DDd6FaB9118b0Fd80FB9949D4)
+- **Contract Source:** [`contracts/ip_copyright_court_x.py`](contracts/ip_copyright_court_x.py)
+
+---
+
+## 2. Abstract & Problem Statement
 
 Open-source creators and maintainers consistently face illegal intellectual property poaching: bad actors clone repositories, strip copyright notices and open-source licenses (MIT, GPL-3.0, Apache-2.0), obscure variable names, and monetize the code without reciprocity or attribution.
 
@@ -32,7 +45,7 @@ Traditional legal arbitration:
 
 ---
 
-## 2. Core Architectural Pillars
+## 3. Core Architectural Pillars
 
 ### 1. Line 1 Dependency Pragma
 Begins directly with `# { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }`, guaranteeing exact build dependency resolution in GenVM without version mismatch.
@@ -68,7 +81,7 @@ If the dispute exceeds the configured deadline without adjudication (`cancel_exp
 
 ---
 
-## 3. Contract Specification
+## 4. Contract Specification
 
 ### Storage Layout
 - `owner: Address` — Administrator/deployer address.
@@ -92,7 +105,7 @@ If the dispute exceeds the configured deadline without adjudication (`cancel_exp
 
 ---
 
-## 4. End-to-End Walkthrough
+## 5. End-to-End Walkthrough
 
 ### Step 1: File Infringement Dispute
 - Complainant Alice calls `file_dispute`:
@@ -119,7 +132,7 @@ If the dispute exceeds the configured deadline without adjudication (`cancel_exp
 
 ---
 
-## 5. Testing & Verification
+## 6. Testing & Verification
 
 Run the comprehensive unit test suite:
 
@@ -142,7 +155,7 @@ pytest -v
 
 ---
 
-## 6. Deployment on GenLayer Studionet
+## 7. Deployment on GenLayer Studionet
 
 1. Open [GenLayer Studio](https://studio.genlayer.com).
 2. Create a new contract file: `ip_copyright_court_x.py`.
