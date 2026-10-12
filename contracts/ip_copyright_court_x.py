@@ -37,9 +37,20 @@ def _safe_transfer(recipient: Address, amount: bigint) -> None:
     gl.get_contract_at(recipient).emit_transfer(value=u256(int(amount)))
 
 
-def _parse_url_host_and_path(raw_url: str) -> tuple[str, str]:
-    """Parse raw URL into validated canonical host and clean path."""
-    clean = raw_url.strip()
+def _clean_path(path_str: str) -> str:
+    """Normalize file path by removing leading/trailing slashes and preventing directory traversal."""
+    p = path_str.strip().replace("\\", "/").strip("/")
+    if ".." in p or p.startswith("./"):
+        raise gl.UserError("Invalid relative path components ('..' or './') in file path.")
+    return p
+
+
+def _parse_canonical_repo(repo_url: str) -> tuple[str, str]:
+    """
+    Extract and validate canonical owner and repository name from authoritative GitHub URLs.
+    Supports https://github.com/<owner>/<repo>
+    """
+    clean = repo_url.strip()
     if "?" in clean:
         clean = clean.split("?")[0]
     if "#" in clean:
@@ -57,15 +68,9 @@ def _parse_url_host_and_path(raw_url: str) -> tuple[str, str]:
     host = parts[0].strip().lower()
     path = parts[1].strip() if len(parts) > 1 else ""
 
-    if host not in ("github.com", "www.github.com", "raw.githubusercontent.com"):
-        raise gl.UserError(f"Host must be github.com or raw.githubusercontent.com, got: {host}")
+    if host not in ("github.com", "www.github.com"):
+        raise gl.UserError(f"Host must be authoritative github.com, got: {host}")
 
-    return host, path
-
-
-def _parse_canonical_repo(repo_url: str) -> tuple[str, str]:
-    """Extract and validate canonical owner and repository name from URL."""
-    _, path = _parse_url_host_and_path(repo_url)
     segments = [s.strip() for s in path.strip("/").split("/") if s.strip()]
     if len(segments) < 2:
         raise gl.UserError("Invalid repository URL format. Expected: https://github.com/<owner>/<repo>")
@@ -81,21 +86,33 @@ def _parse_canonical_repo(repo_url: str) -> tuple[str, str]:
     return owner, repo
 
 
+def _build_canonical_github_raw_url(owner: str, repo: str, branch_or_commit: str, file_path: str) -> str:
+    """Construct authoritative raw GitHub URL from validated repo coordinates."""
+    clean_branch = branch_or_commit.strip() if branch_or_commit.strip() else "main"
+    clean_fp = _clean_path(file_path)
+    return f"https://raw.githubusercontent.com/{owner}/{repo}/{clean_branch}/{clean_fp}"
+
+
 @allow_storage
 @dataclass
 class InfringementDispute:
     dispute_id: str
     complainant: Address
-    original_repo_url: str      # Source repository containing original license/copyright
-    accused_repo_url: str       # Accused repository alleged to be infringing
-    license_type: str           # e.g., "MIT", "GPL-3.0", "APACHE-2.0"
-    original_code_file_url: str # Raw link to original file
-    accused_code_file_url: str  # Raw link to accused copycat file
-    dispute_bond: bigint        # Staked bond by complainant
-    status: str                 # "FILED", "ADJUDICATED", "DISMISSED"
-    verdict: str                # "PENDING", "PROVEN_INFRINGEMENT", "LEGITIMATE_FAIR_USE", "INSUFFICIENT_EVIDENCE"
-    reason: str                 # Consensus explanation
-    deadline: bigint            # Expiration timestamp
+    original_repo_url: str           # Source repository containing original license/copyright
+    accused_repo_url: str            # Accused repository alleged to be infringing
+    original_code_file_path: str     # Relative canonical file path within original repository
+    accused_code_file_path: str      # Relative canonical file path within accused repository
+    original_ref: str                # Authoritative branch/commit ref (e.g. main)
+    accused_ref: str                 # Authoritative branch/commit ref (e.g. main)
+    canonical_orig_file_url: str     # Authoritative raw URL constructed by contract
+    canonical_acc_file_url: str      # Authoritative raw URL constructed by contract
+    dispute_bond: bigint             # Staked bond by complainant
+    status: str                      # "FILED", "ADJUDICATED", "DISMISSED"
+    verdict: str                     # "PENDING", "PROVEN_INFRINGEMENT", "LEGITIMATE_FAIR_USE", "INSUFFICIENT_EVIDENCE"
+    verified_original_license: str   # Independently scraped & verified on-chain license of source
+    verified_accused_license: str    # Independently scraped & verified on-chain license of accused
+    reason: str                      # Consensus explanation detailing AST & authorship provenance
+    deadline: bigint                 # Expiration timestamp
     created_at: bigint
     resolved_at: bigint
 
@@ -157,6 +174,8 @@ class Contract(gl.Contract):
         except Exception as e:
             return {
                 "verdict": "INSUFFICIENT_EVIDENCE",
+                "verified_orig_license": "UNKNOWN",
+                "verified_acc_license": "UNKNOWN",
                 "confidence": 0,
                 "reason": f"Failed to parse LLM JSON: {str(e)[:100]}"
             }
@@ -166,13 +185,15 @@ class Contract(gl.Contract):
         self,
         original_repo_url: str,
         accused_repo_url: str,
-        license_type: str,
-        original_code_file_url: str,
-        accused_code_file_url: str,
+        original_code_file_path: str,
+        accused_code_file_path: str,
+        original_ref: str,
+        accused_ref: str,
         challenge_duration_sec: int
     ) -> str:
         """
         Original creator files an infringement claim against an accused repository, locking a dispute bond.
+        Does NOT rely on caller license declarations: licenses and files are resolved via canonical GitHub hosts.
         """
         bond = bigint(gl.message.value)
         if bond < self.min_dispute_bond:
@@ -187,23 +208,19 @@ class Contract(gl.Contract):
         if canonical_orig == canonical_acc:
             raise gl.UserError("Original and accused repositories cannot be identical.")
 
-        clean_license = license_type.strip().upper()
-        if len(clean_license) < 3:
-            raise gl.UserError("License type is too short (e.g., MIT, GPL-3.0, APACHE-2.0).")
+        clean_orig_path = _clean_path(original_code_file_path)
+        clean_acc_path = _clean_path(accused_code_file_path)
 
-        clean_orig_file = original_code_file_url.strip()
-        clean_acc_file = accused_code_file_url.strip()
+        if not clean_orig_path or len(clean_orig_path) < 2:
+            raise gl.UserError("original_code_file_path is required.")
+        if not clean_acc_path or len(clean_acc_path) < 2:
+            raise gl.UserError("accused_code_file_path is required.")
 
-        if not (clean_orig_file.startswith("http://") or clean_orig_file.startswith("https://")):
-            raise gl.UserError("original_code_file_url must begin with http:// or https://")
-        if not (clean_acc_file.startswith("http://") or clean_acc_file.startswith("https://")):
-            raise gl.UserError("accused_code_file_url must begin with http:// or https://")
+        ref_orig = original_ref.strip() if original_ref.strip() else "main"
+        ref_acc = accused_ref.strip() if accused_ref.strip() else "main"
 
-        # Canonical Binding: verify file URLs correspond to configured repos
-        if f"{orig_owner}/{orig_repo}".lower() not in clean_orig_file.lower():
-            raise gl.UserError("original_code_file_url does not belong to original repository.")
-        if f"{acc_owner}/{acc_repo}".lower() not in clean_acc_file.lower():
-            raise gl.UserError("accused_code_file_url does not belong to accused repository.")
+        canonical_orig_url = _build_canonical_github_raw_url(orig_owner, orig_repo, ref_orig, clean_orig_path)
+        canonical_acc_url = _build_canonical_github_raw_url(acc_owner, acc_repo, ref_acc, clean_acc_path)
 
         now_ts = self._get_current_timestamp()
         duration = bigint(challenge_duration_sec if challenge_duration_sec >= 86400 else 86400)
@@ -217,13 +234,18 @@ class Contract(gl.Contract):
             complainant=_get_sender(),
             original_repo_url=canonical_orig,
             accused_repo_url=canonical_acc,
-            license_type=clean_license,
-            original_code_file_url=clean_orig_file,
-            accused_code_file_url=clean_acc_file,
+            original_code_file_path=clean_orig_path,
+            accused_code_file_path=clean_acc_path,
+            original_ref=ref_orig,
+            accused_ref=ref_acc,
+            canonical_orig_file_url=canonical_orig_url,
+            canonical_acc_file_url=canonical_acc_url,
             dispute_bond=bond,
             status="FILED",
             verdict="PENDING",
-            reason="Infringement dispute registered. Awaiting autonomous AI adjudication.",
+            verified_original_license="PENDING_VERIFICATION",
+            verified_accused_license="PENDING_VERIFICATION",
+            reason="Infringement dispute registered. Awaiting autonomous multi-source AI adjudication.",
             deadline=deadline,
             created_at=self.dispute_count,
             resolved_at=bigint(0)
@@ -234,8 +256,13 @@ class Contract(gl.Contract):
     @gl.public.write
     def adjudicate_dispute(self, dispute_id: str) -> None:
         """
-        Validators inspect both code files, evaluate code identity, copyright notices, and license adherence,
-        then reach 100% discrete consensus on infringement.
+        Independent On-Chain Fact & Evidence Acquisition:
+        Validators independently fetch:
+          1. Original repository's official LICENSE / LICENSE.md file (verifying genuine open-source grant & terms)
+          2. Accused repository's official LICENSE file (detecting stripping or proprietary conversion)
+          3. Original code file directly from authoritative GitHub raw host
+          4. Accused code file directly from authoritative GitHub raw host
+        Validators then perform AST & authorship provenance analysis and reach 100% discrete consensus.
         """
         if dispute_id not in self.disputes:
             raise gl.UserError("Dispute not found.")
@@ -244,64 +271,132 @@ class Contract(gl.Contract):
         if dispute.status != "FILED":
             raise gl.UserError("Dispute is already resolved or dismissed.")
 
-        orig_url_local = str(dispute.original_code_file_url)
-        acc_url_local = str(dispute.accused_code_file_url)
-        lic_local = str(dispute.license_type)
-        acc_repo_local = str(dispute.accused_repo_url)
+        orig_repo_url = str(dispute.original_repo_url)
+        acc_repo_url = str(dispute.accused_repo_url)
+        orig_owner, orig_repo = _parse_canonical_repo(orig_repo_url)
+        acc_owner, acc_repo = _parse_canonical_repo(acc_repo_url)
+
+        orig_ref = str(dispute.original_ref)
+        acc_ref = str(dispute.accused_ref)
+        orig_file_url = str(dispute.canonical_orig_file_url)
+        acc_file_url = str(dispute.canonical_acc_file_url)
+
+        # Canonical authoritative raw license URLs for both repositories
+        orig_license_url_1 = f"https://raw.githubusercontent.com/{orig_owner}/{orig_repo}/{orig_ref}/LICENSE"
+        orig_license_url_2 = f"https://raw.githubusercontent.com/{orig_owner}/{orig_repo}/{orig_ref}/LICENSE.md"
+
+        acc_license_url_1 = f"https://raw.githubusercontent.com/{acc_owner}/{acc_repo}/{acc_ref}/LICENSE"
+        acc_license_url_2 = f"https://raw.githubusercontent.com/{acc_owner}/{acc_repo}/{acc_ref}/LICENSE.md"
 
         def leader_fn():
-            # 1. Fetch original code snippet
+            # 1. Acquire original repository LICENSE independently
+            orig_license_content = ""
+            for lic_url in (orig_license_url_1, orig_license_url_2):
+                try:
+                    res = gl.nondet.web.render(lic_url, mode="text")
+                    text = res.content if hasattr(res, "content") else str(res)
+                    if text and len(text.strip()) > 10 and "404" not in text[:50]:
+                        orig_license_content = text
+                        break
+                except Exception:
+                    pass
+
+            # 2. Acquire accused repository LICENSE independently
+            acc_license_content = ""
+            for lic_url in (acc_license_url_1, acc_license_url_2):
+                try:
+                    res = gl.nondet.web.render(lic_url, mode="text")
+                    text = res.content if hasattr(res, "content") else str(res)
+                    if text and len(text.strip()) > 10 and "404" not in text[:50]:
+                        acc_license_content = text
+                        break
+                except Exception:
+                    pass
+
+            # 3. Fetch original code file from authoritative raw GitHub host
             orig_code = ""
             try:
-                res_orig = gl.nondet.web.render(orig_url_local, mode="text")
+                res_orig = gl.nondet.web.render(orig_file_url, mode="text")
                 orig_code = res_orig.content if hasattr(res_orig, "content") else str(res_orig)
             except Exception:
                 orig_code = ""
 
-            # 2. Fetch accused code snippet
+            # 4. Fetch accused code file from authoritative raw GitHub host
             acc_code = ""
             try:
-                res_acc = gl.nondet.web.render(acc_url_local, mode="text")
+                res_acc = gl.nondet.web.render(acc_file_url, mode="text")
                 acc_code = res_acc.content if hasattr(res_acc, "content") else str(res_acc)
             except Exception:
                 acc_code = ""
 
+            # Check if code files are accessible
             if len(orig_code.strip()) < 20 or len(acc_code.strip()) < 20:
                 return {
                     "verdict": "INSUFFICIENT_EVIDENCE",
+                    "verified_orig_license": "UNRESOLVED_404",
+                    "verified_acc_license": "UNRESOLVED_404",
                     "confidence": 100,
-                    "reason": "One or both code source files are offline, 404, or blank."
+                    "reason": "One or both code source files are offline, 404, or blank on GitHub."
                 }
 
-            snippet_orig = orig_code[:3500]
-            snippet_acc = acc_code[:3500]
+            # If original repository lacks any open source LICENSE file, claim lacks legal standing
+            if not orig_license_content.strip():
+                return {
+                    "verdict": "INSUFFICIENT_EVIDENCE",
+                    "verified_orig_license": "NO_LICENSE_FOUND",
+                    "verified_acc_license": "N/A",
+                    "confidence": 100,
+                    "reason": "Original repository has no verifiable LICENSE file on GitHub; cannot establish declared license terms."
+                }
 
-            prompt = f"""You are an Objective Open-Source Intellectual Property & License Arbiter on GenLayer.
-Evaluate whether the Accused Code impermissibly copies the Original Code in breach of open-source license standards.
+            snippet_orig_lic = orig_license_content[:1500]
+            snippet_acc_lic = acc_license_content[:1500] if acc_license_content else "(NO LICENSE FILE FOUND IN ACCUSED REPO)"
+            snippet_orig = orig_code[:3000]
+            snippet_acc = acc_code[:3000]
 
-DECLARED LICENSE: {lic_local}
-ACCUSED REPOSITORY: {acc_repo_local}
+            prompt = f"""You are an Objective Open-Source Intellectual Property, License, & Code Provenance Arbiter on GenLayer.
+Evaluate whether the Accused Repository impermissibly copies the Original Work in breach of open-source license standards.
 
-ORIGINAL CODE:
+EVIDENCE INDEPENDENTLY ACQUIRED FROM GITHUB:
+ORIGINAL REPO: {orig_repo_url}
+ACCUSED REPO: {acc_repo_url}
+
+ORIGINAL REPO VERIFIED LICENSE FILE:
+\"\"\"
+{snippet_orig_lic}
+\"\"\"
+
+ACCUSED REPO VERIFIED LICENSE FILE:
+\"\"\"
+{snippet_acc_lic}
+\"\"\"
+
+ORIGINAL SOURCE CODE:
 \"\"\"
 {snippet_orig}
 \"\"\"
 
-ACCUSED CODE:
+ACCUSED SOURCE CODE:
 \"\"\"
 {snippet_acc}
 \"\"\"
 
-LEGAL ARBITRATION RUBRIC:
-Classify into strictly ONE of the following discrete verdicts:
-- "PROVEN_INFRINGEMENT": Substantial structural, algorithmic, or verbatim code duplication exists where copyright headers were stripped, license notices removed, or license constraints (such as copyleft reciprocity) breached.
-- "LEGITIMATE_FAIR_USE": Normal use of generic standard library APIs, independent clean-room re-implementation, or properly attributed usage complying with the license terms.
-- "INSUFFICIENT_EVIDENCE": The two files are fundamentally distinct, insufficient code overlap exists, or context is ambiguous.
+ARBITRATION & PROVENANCE EVALUATION RUBRIC:
+1. Identify the genuine license of the original work (e.g. MIT, GPL-3.0, Apache-2.0, BSD-3-Clause).
+2. Assess authorship & license provenance: Did the accused repo strip original copyright notices, delete the required LICENSE file, or convert copyleft code into proprietary/unattributed software?
+3. Compare AST & semantic algorithmic duplication between original and accused files.
+
+Classify into strictly ONE of the discrete verdicts:
+- "PROVEN_INFRINGEMENT": Substantial structural, algorithmic, or verbatim code duplication exists where copyright headers were stripped, license notices removed, copyleft reciprocity breached, or code re-licensed without attribution.
+- "LEGITIMATE_FAIR_USE": Valid clean-room re-implementation, generic library APIs, or properly attributed usage in full compliance with the original license.
+- "INSUFFICIENT_EVIDENCE": Fundamentally distinct logic, negligible code overlap, or ambiguous provenance evidence.
 
 OUTPUT FORMAT:
 Respond ONLY with a VALID JSON object (no markdown, no backticks):
 {{
   "verdict": "PROVEN_INFRINGEMENT" | "LEGITIMATE_FAIR_USE" | "INSUFFICIENT_EVIDENCE",
+  "verified_orig_license": "<Identified Original License e.g. MIT, GPL-3.0, APACHE-2.0, or UNKNOWN>",
+  "verified_acc_license": "<Identified Accused License or NONE_STRIPPED>",
   "confidence": <integer from 0 to 100>,
   "reason": "<concise explanation max 220 characters>"
 }}"""
@@ -329,22 +424,29 @@ Respond ONLY with a VALID JSON object (no markdown, no backticks):
                 if verdict_candidate not in valid_verdicts:
                     verdict_candidate = "INSUFFICIENT_EVIDENCE"
 
+                orig_lic_ident = str(parsed.get("verified_orig_license", "UNKNOWN"))[:50].strip()
+                acc_lic_ident = str(parsed.get("verified_acc_license", "NONE"))[:50].strip()
+
                 try:
                     conf = int(parsed.get("confidence", 0))
                     conf = max(0, min(100, conf))
                 except Exception:
                     conf = 50
 
-                reason_str = str(parsed.get("reason", "IP evaluated by autonomous AI jury."))[:220]
+                reason_str = str(parsed.get("reason", "IP & provenance evaluated by autonomous AI jury."))[:220]
 
                 return {
                     "verdict": verdict_candidate,
+                    "verified_orig_license": orig_lic_ident,
+                    "verified_acc_license": acc_lic_ident,
                     "confidence": conf,
                     "reason": reason_str
                 }
             except Exception as e:
                 return {
                     "verdict": "INSUFFICIENT_EVIDENCE",
+                    "verified_orig_license": "ERROR",
+                    "verified_acc_license": "ERROR",
                     "confidence": 0,
                     "reason": f"Evaluation error: {str(e)[:100]}"
                 }
@@ -364,7 +466,7 @@ Respond ONLY with a VALID JSON object (no markdown, no backticks):
             mine = leader_fn()
             m_verdict = str(mine.get("verdict", "")).strip().upper()
 
-            # DISCRETE EQUIVALENCE: 100% agreement on exact discrete IP verdict
+            # DISCRETE EQUIVALENCE: 100% agreement on exact discrete legal verdict
             return l_verdict == m_verdict
 
         adjudication_res = gl.vm.run_nondet(leader_fn, validator_fn)
@@ -379,9 +481,13 @@ Respond ONLY with a VALID JSON object (no markdown, no backticks):
             verdict = "INSUFFICIENT_EVIDENCE"
 
         reason = str(final_res.get("reason", "Consensus concluded."))
+        orig_lic = str(final_res.get("verified_orig_license", "UNKNOWN"))
+        acc_lic = str(final_res.get("verified_acc_license", "UNKNOWN"))
 
         dispute.status = "ADJUDICATED"
         dispute.verdict = verdict
+        dispute.verified_original_license = orig_lic
+        dispute.verified_accused_license = acc_lic
         dispute.reason = reason
         dispute.resolved_at = self.dispute_count
 
@@ -451,12 +557,17 @@ Respond ONLY with a VALID JSON object (no markdown, no backticks):
             "complainant": _addr_str(d.complainant),
             "original_repo": d.original_repo_url,
             "accused_repo": d.accused_repo_url,
-            "license_type": d.license_type,
-            "original_file": d.original_code_file_url,
-            "accused_file": d.accused_code_file_url,
+            "original_code_file_path": d.original_code_file_path,
+            "accused_code_file_path": d.accused_code_file_path,
+            "original_ref": d.original_ref,
+            "accused_ref": d.accused_ref,
+            "canonical_orig_file_url": d.canonical_orig_file_url,
+            "canonical_acc_file_url": d.canonical_acc_file_url,
             "dispute_bond": str(d.dispute_bond),
             "status": d.status,
             "verdict": d.verdict,
+            "verified_original_license": d.verified_original_license,
+            "verified_accused_license": d.verified_accused_license,
             "reason": d.reason,
             "deadline": str(d.deadline),
             "created_at": str(d.created_at),

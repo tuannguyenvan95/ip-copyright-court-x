@@ -45,22 +45,25 @@ def test_initial_state(contract, direct_vm, direct_alice):
     assert contract.get_owner() == _to_hex(direct_vm.sender)
 
 
-def test_file_dispute_success(contract, direct_vm, direct_alice):
-    """1. Test creator filing an infringement dispute with bond >= min_dispute_bond."""
+def test_file_dispute_success_canonical_paths(contract, direct_vm, direct_alice):
+    """
+    Test creator filing an infringement dispute.
+    Validates canonical GitHub repositories, constructs authoritative raw URLs automatically,
+    and binds relative file paths on-chain without trusting caller license strings.
+    """
     direct_vm.sender = direct_alice
     direct_vm.value = 1500
 
     orig_repo = "https://github.com/alice-dev/cryptolib"
     acc_repo = "https://github.com/bob-copycat/cryptolib-fork"
-    orig_file = "https://raw.githubusercontent.com/alice-dev/cryptolib/main/cipher.py"
-    acc_file = "https://raw.githubusercontent.com/bob-copycat/cryptolib-fork/main/cipher.py"
 
     did = contract.file_dispute(
         original_repo_url=orig_repo,
         accused_repo_url=acc_repo,
-        license_type="MIT",
-        original_code_file_url=orig_file,
-        accused_code_file_url=acc_file,
+        original_code_file_path="src/cipher.py",
+        accused_code_file_path="src/cipher.py",
+        original_ref="main",
+        accused_ref="main",
         challenge_duration_sec=86400 * 3
     )
     assert str(did) == "1"
@@ -71,10 +74,12 @@ def test_file_dispute_success(contract, direct_vm, direct_alice):
     assert d_json["complainant"] == _to_hex(direct_alice)
     assert d_json["original_repo"] == "https://github.com/alice-dev/cryptolib"
     assert d_json["accused_repo"] == "https://github.com/bob-copycat/cryptolib-fork"
-    assert d_json["license_type"] == "MIT"
+    assert d_json["canonical_orig_file_url"] == "https://raw.githubusercontent.com/alice-dev/cryptolib/main/src/cipher.py"
+    assert d_json["canonical_acc_file_url"] == "https://raw.githubusercontent.com/bob-copycat/cryptolib-fork/main/src/cipher.py"
     assert d_json["dispute_bond"] == "1500"
     assert d_json["status"] == "FILED"
     assert d_json["verdict"] == "PENDING"
+    assert d_json["verified_original_license"] == "PENDING_VERIFICATION"
     assert contract.is_repo_blacklisted("https://github.com/bob-copycat/cryptolib-fork") is False
 
 
@@ -88,9 +93,10 @@ def test_file_dispute_validation_errors(contract, direct_vm, direct_alice):
         contract.file_dispute(
             original_repo_url="https://github.com/alice-dev/cryptolib",
             accused_repo_url="https://github.com/bob-copycat/cryptolib-fork",
-            license_type="MIT",
-            original_code_file_url="https://raw.githubusercontent.com/alice-dev/cryptolib/main/cipher.py",
-            accused_code_file_url="https://raw.githubusercontent.com/bob-copycat/cryptolib-fork/main/cipher.py",
+            original_code_file_path="cipher.py",
+            accused_code_file_path="cipher.py",
+            original_ref="main",
+            accused_ref="main",
             challenge_duration_sec=86400
         )
     assert "Dispute bond must be at least 1000 wei" in str(exc.value)
@@ -101,66 +107,49 @@ def test_file_dispute_validation_errors(contract, direct_vm, direct_alice):
         contract.file_dispute(
             original_repo_url="https://github.com/alice-dev/cryptolib",
             accused_repo_url="https://github.com/alice-dev/cryptolib",
-            license_type="MIT",
-            original_code_file_url="https://raw.githubusercontent.com/alice-dev/cryptolib/main/cipher.py",
-            accused_code_file_url="https://raw.githubusercontent.com/alice-dev/cryptolib/main/cipher.py",
+            original_code_file_path="cipher.py",
+            accused_code_file_path="cipher.py",
+            original_ref="main",
+            accused_ref="main",
             challenge_duration_sec=86400
         )
     assert "Original and accused repositories cannot be identical" in str(exc.value)
 
-    # 3. License type too short
+    # 3. Path traversal attack in file path
     with pytest.raises(Exception) as exc:
         contract.file_dispute(
             original_repo_url="https://github.com/alice-dev/cryptolib",
             accused_repo_url="https://github.com/bob-copycat/cryptolib-fork",
-            license_type="A",
-            original_code_file_url="https://raw.githubusercontent.com/alice-dev/cryptolib/main/cipher.py",
-            accused_code_file_url="https://raw.githubusercontent.com/bob-copycat/cryptolib-fork/main/cipher.py",
+            original_code_file_path="../etc/passwd",
+            accused_code_file_path="cipher.py",
+            original_ref="main",
+            accused_ref="main",
             challenge_duration_sec=86400
         )
-    assert "License type is too short" in str(exc.value)
+    assert "Invalid relative path components" in str(exc.value)
 
-    # 4. Host not github.com
+    # 4. Host not authoritative github.com
     with pytest.raises(Exception) as exc:
         contract.file_dispute(
             original_repo_url="https://gitlab.com/alice-dev/cryptolib",
             accused_repo_url="https://github.com/bob-copycat/cryptolib-fork",
-            license_type="MIT",
-            original_code_file_url="https://gitlab.com/alice-dev/cryptolib/main/cipher.py",
-            accused_code_file_url="https://raw.githubusercontent.com/bob-copycat/cryptolib-fork/main/cipher.py",
+            original_code_file_path="cipher.py",
+            accused_code_file_path="cipher.py",
+            original_ref="main",
+            accused_ref="main",
             challenge_duration_sec=86400
         )
-    assert "Host must be github.com" in str(exc.value)
-
-    # 5. Canonical binding mismatch: file URL does not match original repo
-    with pytest.raises(Exception) as exc:
-        contract.file_dispute(
-            original_repo_url="https://github.com/alice-dev/cryptolib",
-            accused_repo_url="https://github.com/bob-copycat/cryptolib-fork",
-            license_type="MIT",
-            original_code_file_url="https://raw.githubusercontent.com/unrelated/otherrepo/main/cipher.py",
-            accused_code_file_url="https://raw.githubusercontent.com/bob-copycat/cryptolib-fork/main/cipher.py",
-            challenge_duration_sec=86400
-        )
-    assert "original_code_file_url does not belong to original repository" in str(exc.value)
-
-    # 6. Canonical binding mismatch: file URL does not match accused repo
-    with pytest.raises(Exception) as exc:
-        contract.file_dispute(
-            original_repo_url="https://github.com/alice-dev/cryptolib",
-            accused_repo_url="https://github.com/bob-copycat/cryptolib-fork",
-            license_type="MIT",
-            original_code_file_url="https://raw.githubusercontent.com/alice-dev/cryptolib/main/cipher.py",
-            accused_code_file_url="https://raw.githubusercontent.com/unrelated/otherrepo/main/cipher.py",
-            challenge_duration_sec=86400
-        )
-    assert "accused_code_file_url does not belong to accused repository" in str(exc.value)
+    assert "Host must be authoritative github.com" in str(exc.value)
 
 
-def test_adjudicate_proven_infringement_blacklists_and_refunds(contract, direct_vm, direct_alice):
+def test_adjudicate_proven_infringement_independent_license_verification(contract, direct_vm, direct_alice):
     """
     Consensus Outcome 1: PROVEN_INFRINGEMENT
-    LLM consensus confirms copycat violation -> blacklists accused repo & refunds bond to complainant.
+    Validators independently acquire:
+      - Original repository's verified LICENSE file (GPL-3.0)
+      - Accused repository's lack of LICENSE file or stripped headers
+      - AST analysis of code duplication
+    Result: Infringing repo blacklisted on-chain, complainant bond refunded, verified licenses saved.
     """
     setup_post_message_hook(direct_vm)
 
@@ -170,23 +159,29 @@ def test_adjudicate_proven_infringement_blacklists_and_refunds(contract, direct_
     did = contract.file_dispute(
         original_repo_url="https://github.com/alice-dev/secure-math",
         accused_repo_url="https://github.com/stealer-dev/secure-math-clone",
-        license_type="GPL-3.0",
-        original_code_file_url="https://raw.githubusercontent.com/alice-dev/secure-math/main/math.py",
-        accused_code_file_url="https://raw.githubusercontent.com/stealer-dev/secure-math-clone/main/math.py",
+        original_code_file_path="math.py",
+        accused_code_file_path="math.py",
+        original_ref="main",
+        accused_ref="main",
         challenge_duration_sec=86400 * 5
     )
 
-    # Mock web content
+    orig_lic = "GNU GENERAL PUBLIC LICENSE Version 3, 29 June 2007. Copyright (C) 2025 Alice Nakamoto."
     code_alice = "'''Copyright (C) Alice - GPL-3.0'''\ndef compute_curve_points(a, b):\n    return [x**2 + a*x + b for x in range(100)]\n"
     code_stealer = "# Proprietary closed logic - All rights reserved\ndef compute_curve_points(a, b):\n    return [x**2 + a*x + b for x in range(100)]\n"
 
-    direct_vm.mock_web(".*alice-dev.*", {"status": 200, "body": code_alice})
-    direct_vm.mock_web(".*stealer-dev.*", {"status": 200, "body": code_stealer})
+    # Mocks for independent evidence acquisition
+    direct_vm.mock_web(".*alice-dev/secure-math/main/LICENSE.*", {"status": 200, "body": orig_lic})
+    direct_vm.mock_web(".*stealer-dev/secure-math-clone/main/LICENSE.*", {"status": 404, "body": "404 Not Found"})
+    direct_vm.mock_web(".*alice-dev/secure-math/main/math.py.*", {"status": 200, "body": code_alice})
+    direct_vm.mock_web(".*stealer-dev/secure-math-clone/main/math.py.*", {"status": 200, "body": code_stealer})
 
     direct_vm.mock_llm(".*", json.dumps({
         "verdict": "PROVEN_INFRINGEMENT",
-        "confidence": 98,
-        "reason": "Direct code copy with license header stripped and re-licensed as proprietary in violation of GPL-3.0."
+        "verified_orig_license": "GPL-3.0",
+        "verified_acc_license": "NONE_STRIPPED",
+        "confidence": 99,
+        "reason": "Direct code copy with license header stripped and GPL-3.0 deleted. Closed-source re-licensing violates copyleft reciprocity."
     }))
 
     contract.adjudicate_dispute(did)
@@ -194,6 +189,8 @@ def test_adjudicate_proven_infringement_blacklists_and_refunds(contract, direct_
     d_json = json.loads(contract.get_dispute(did))
     assert d_json["status"] == "ADJUDICATED"
     assert d_json["verdict"] == "PROVEN_INFRINGEMENT"
+    assert d_json["verified_original_license"] == "GPL-3.0"
+    assert d_json["verified_accused_license"] == "NONE_STRIPPED"
     assert "Direct code copy" in d_json["reason"]
 
     # Accused repo is blacklisted
@@ -207,7 +204,8 @@ def test_adjudicate_proven_infringement_blacklists_and_refunds(contract, direct_
 def test_adjudicate_legitimate_fair_use_forfeits_bond(contract, direct_vm, direct_alice):
     """
     Consensus Outcome 2: LEGITIMATE_FAIR_USE
-    LLM consensus finds clean-room or valid fair use -> accused is exonerated, complainant bond forfeited.
+    Validators inspect both repos: accused developed clean-room code and has independent MIT license.
+    Result: Accused exonerated, complainant bond forfeited to court.
     """
     setup_post_message_hook(direct_vm)
 
@@ -217,22 +215,29 @@ def test_adjudicate_legitimate_fair_use_forfeits_bond(contract, direct_vm, direc
     did = contract.file_dispute(
         original_repo_url="https://github.com/alice-dev/utils",
         accused_repo_url="https://github.com/bob-clean/utils",
-        license_type="MIT",
-        original_code_file_url="https://raw.githubusercontent.com/alice-dev/utils/main/helper.py",
-        accused_code_file_url="https://raw.githubusercontent.com/bob-clean/utils/main/helper.py",
+        original_code_file_path="helper.py",
+        accused_code_file_path="helper.py",
+        original_ref="main",
+        accused_ref="main",
         challenge_duration_sec=86400 * 5
     )
 
+    orig_lic = "MIT License. Copyright (c) 2024 Alice."
+    acc_lic = "MIT License. Copyright (c) 2025 Bob Clean."
     code_alice = "import os\ndef get_env(k):\n    return os.environ.get(k, None)\n"
     code_bob = "import os\ndef fetch_var(name):\n    return os.getenv(name)\n"
 
-    direct_vm.mock_web(".*alice-dev.*", {"status": 200, "body": code_alice})
-    direct_vm.mock_web(".*bob-clean.*", {"status": 200, "body": code_bob})
+    direct_vm.mock_web(".*alice-dev/utils/main/LICENSE.*", {"status": 200, "body": orig_lic})
+    direct_vm.mock_web(".*bob-clean/utils/main/LICENSE.*", {"status": 200, "body": acc_lic})
+    direct_vm.mock_web(".*alice-dev/utils/main/helper.py.*", {"status": 200, "body": code_alice})
+    direct_vm.mock_web(".*bob-clean/utils/main/helper.py.*", {"status": 200, "body": code_bob})
 
     direct_vm.mock_llm(".*", json.dumps({
         "verdict": "LEGITIMATE_FAIR_USE",
+        "verified_orig_license": "MIT",
+        "verified_acc_license": "MIT",
         "confidence": 95,
-        "reason": "Generic standard library usage with distinct function implementations. Independent development."
+        "reason": "Independent clean-room re-implementation using standard library APIs. Proper MIT attribution preserved."
     }))
 
     contract.adjudicate_dispute(did)
@@ -240,6 +245,8 @@ def test_adjudicate_legitimate_fair_use_forfeits_bond(contract, direct_vm, direc
     d_json = json.loads(contract.get_dispute(did))
     assert d_json["status"] == "ADJUDICATED"
     assert d_json["verdict"] == "LEGITIMATE_FAIR_USE"
+    assert d_json["verified_original_license"] == "MIT"
+    assert d_json["verified_accused_license"] == "MIT"
 
     # Accused repo NOT blacklisted
     assert contract.is_repo_blacklisted("https://github.com/bob-clean/utils") is False
@@ -249,10 +256,11 @@ def test_adjudicate_legitimate_fair_use_forfeits_bond(contract, direct_vm, direc
     assert direct_vm._balances.get(alice_bytes, 0) == 0
 
 
-def test_adjudicate_insufficient_evidence_refunds_bond(contract, direct_vm, direct_alice):
+def test_adjudicate_original_lacks_license_file(contract, direct_vm, direct_alice):
     """
-    Consensus Outcome 3: INSUFFICIENT_EVIDENCE
-    Files empty, 404, or ambiguous code -> safe bond refund to complainant.
+    Provenance Guard:
+    If original repository does not possess a verified open-source LICENSE file on GitHub,
+    validators conclude INSUFFICIENT_EVIDENCE due to lack of verified license terms.
     """
     setup_post_message_hook(direct_vm)
 
@@ -260,29 +268,29 @@ def test_adjudicate_insufficient_evidence_refunds_bond(contract, direct_vm, dire
     direct_vm.value = 1200
 
     did = contract.file_dispute(
-        original_repo_url="https://github.com/alice-dev/ai-core",
-        accused_repo_url="https://github.com/other-dev/ai-core",
-        license_type="APACHE-2.0",
-        original_code_file_url="https://raw.githubusercontent.com/alice-dev/ai-core/main/model.py",
-        accused_code_file_url="https://raw.githubusercontent.com/other-dev/ai-core/main/model.py",
+        original_repo_url="https://github.com/alice-dev/unlicensed-repo",
+        accused_repo_url="https://github.com/other-dev/repo-b",
+        original_code_file_path="code.py",
+        accused_code_file_path="code.py",
+        original_ref="main",
+        accused_ref="main",
         challenge_duration_sec=86400 * 2
     )
 
-    # Empty web contents
-    direct_vm.mock_web(".*alice-dev.*", {"status": 200, "body": "short"})
-    direct_vm.mock_web(".*other-dev.*", {"status": 200, "body": "short"})
+    # Original repo has no LICENSE file (404)
+    direct_vm.mock_web(".*alice-dev/unlicensed-repo/main/LICENSE.*", {"status": 404, "body": "404 Not Found"})
+    direct_vm.mock_web(".*alice-dev/unlicensed-repo/main/code.py.*", {"status": 200, "body": "def foo(): return 42\n" * 10})
+    direct_vm.mock_web(".*other-dev/repo-b/main/code.py.*", {"status": 200, "body": "def bar(): return 42\n" * 10})
 
     contract.adjudicate_dispute(did)
 
     d_json = json.loads(contract.get_dispute(did))
     assert d_json["status"] == "ADJUDICATED"
     assert d_json["verdict"] == "INSUFFICIENT_EVIDENCE"
-    assert "offline, 404, or blank" in d_json["reason"]
+    assert "no verifiable LICENSE file" in d_json["reason"]
+    assert d_json["verified_original_license"] == "NO_LICENSE_FOUND"
 
-    # Accused repo NOT blacklisted
-    assert contract.is_repo_blacklisted("https://github.com/other-dev/ai-core") is False
-
-    # Complainant bond refunded
+    # Complainant bond refunded safely
     alice_bytes = direct_vm._to_bytes(direct_alice)
     assert direct_vm._balances.get(alice_bytes, 0) == 1200
 
@@ -295,15 +303,25 @@ def test_double_adjudication_prevention(contract, direct_vm, direct_alice):
     did = contract.file_dispute(
         original_repo_url="https://github.com/alice-dev/lib1",
         accused_repo_url="https://github.com/bob-dev/lib1",
-        license_type="MIT",
-        original_code_file_url="https://raw.githubusercontent.com/alice-dev/lib1/main/lib.py",
-        accused_code_file_url="https://raw.githubusercontent.com/bob-dev/lib1/main/lib.py",
+        original_code_file_path="lib.py",
+        accused_code_file_path="lib.py",
+        original_ref="main",
+        accused_ref="main",
         challenge_duration_sec=86400
     )
 
-    direct_vm.mock_web(".*alice-dev.*", {"status": 200, "body": "x" * 50})
-    direct_vm.mock_web(".*bob-dev.*", {"status": 200, "body": "y" * 50})
-    direct_vm.mock_llm(".*", json.dumps({"verdict": "INSUFFICIENT_EVIDENCE", "confidence": 90, "reason": "No match."}))
+    orig_lic = "MIT License (c) Alice"
+    direct_vm.mock_web(".*alice-dev/lib1/main/LICENSE.*", {"status": 200, "body": orig_lic})
+    direct_vm.mock_web(".*bob-dev/lib1/main/LICENSE.*", {"status": 404, "body": "404"})
+    direct_vm.mock_web(".*alice-dev/lib1/main/lib.py.*", {"status": 200, "body": "x = 1\n" * 20})
+    direct_vm.mock_web(".*bob-dev/lib1/main/lib.py.*", {"status": 200, "body": "y = 2\n" * 20})
+    direct_vm.mock_llm(".*", json.dumps({
+        "verdict": "INSUFFICIENT_EVIDENCE",
+        "verified_orig_license": "MIT",
+        "verified_acc_license": "NONE",
+        "confidence": 90,
+        "reason": "No match."
+    }))
 
     contract.adjudicate_dispute(did)
 
@@ -324,9 +342,10 @@ def test_cancel_expired_dispute_recovery_path(contract, direct_vm, direct_alice,
     did = contract.file_dispute(
         original_repo_url="https://github.com/alice-dev/unadjudicated-repo",
         accused_repo_url="https://github.com/troll-dev/copycat-repo",
-        license_type="MIT",
-        original_code_file_url="https://raw.githubusercontent.com/alice-dev/unadjudicated-repo/main/code.py",
-        accused_code_file_url="https://raw.githubusercontent.com/troll-dev/copycat-repo/main/code.py",
+        original_code_file_path="code.py",
+        accused_code_file_path="code.py",
+        original_ref="main",
+        accused_ref="main",
         challenge_duration_sec=86400
     )
 
@@ -339,25 +358,22 @@ def test_cancel_expired_dispute_recovery_path(contract, direct_vm, direct_alice,
         contract.cancel_expired_dispute(did)
     assert "Only complainant can cancel expired dispute" in str(exc.value)
 
-    # 2. Cannot cancel before deadline if timestamp is set and <= deadline
+    # 2. Cannot cancel before deadline
     direct_vm.warp("2026-06-01T10:00:00Z")
-    now_ts = contract.get_current_time()
-    
-    # File another dispute with explicit future deadline relative to warped time
     direct_vm.sender = direct_alice
     direct_vm.value = 3000
     did2 = contract.file_dispute(
         original_repo_url="https://github.com/alice-dev/unadjudicated-repo-2",
         accused_repo_url="https://github.com/troll-dev/copycat-repo-2",
-        license_type="MIT",
-        original_code_file_url="https://raw.githubusercontent.com/alice-dev/unadjudicated-repo-2/main/code.py",
-        accused_code_file_url="https://raw.githubusercontent.com/troll-dev/copycat-repo-2/main/code.py",
+        original_code_file_path="code.py",
+        accused_code_file_path="code.py",
+        original_ref="main",
+        accused_ref="main",
         challenge_duration_sec=86400
     )
     d_json2 = json.loads(contract.get_dispute(did2))
     deadline2 = int(d_json2["deadline"])
 
-    # Attempting to cancel before deadline fails
     with pytest.raises(Exception) as exc:
         contract.cancel_expired_dispute(did2)
     assert "Dispute deadline has not passed yet" in str(exc.value)
@@ -401,9 +417,10 @@ def test_invalid_url_protocol(contract, direct_alice, direct_vm):
         contract.file_dispute(
             original_repo_url="ftp://github.com/alice/repo",
             accused_repo_url="https://github.com/bob/repo",
-            license_type="MIT",
-            original_code_file_url="https://raw.githubusercontent.com/alice/repo/main/code.py",
-            accused_code_file_url="https://raw.githubusercontent.com/bob/repo/main/code.py",
+            original_code_file_path="code.py",
+            accused_code_file_path="code.py",
+            original_ref="main",
+            accused_ref="main",
             challenge_duration_sec=86400
         )
     assert "URL must begin with http:// or https://" in str(exc.value)
